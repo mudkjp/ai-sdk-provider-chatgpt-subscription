@@ -1,0 +1,64 @@
+{
+	"name": "@mudkipdev/ai-sdk-provider-chatgpt-subscription",
+	"version": "0.1.0",
+	"description": "AI SDK provider for ChatGPT plan usage with OAuth sign-in, token refresh, model discovery, and Responses API support",
+	"keywords": [
+		"ai-sdk",
+		"chatgpt",
+		"openai",
+		"oauth",
+		"provider",
+		"subscription"
+	],
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"bin": {
+		"chatgpt-subscription": "./dist/cli.js"
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist"
+	],
+	"sideEffects": false,
+	"engines": {
+		"node": ">=20.3"
+	},
+	"scripts": {
+		"build": "rm -rf dist && tsc",
+		"typecheck": "tsc --noEmit",
+		"prepack": "npm run typecheck && npm run build"
+	},
+	"dependencies": {
+		"@ai-sdk/openai": "4.0.103",
+		"@ai-sdk/provider": "4.0.34",
+		"@ai-sdk/provider-utils": "5.0.69",
+		"jose": "^6.2.13",
+		"proper-lockfile": "^4.1.2"
+	},
+	"peerDependencies": {
+		"ai": "^7.0.0",
+		"zod": "^3.25.76 || ^4.1.8"
+	},
+	"devDependencies": {
+		"@types/node": "^26.6.5",
+		"@types/proper-lockfile": "^4.1.4",
+		"typescript": "^7.0.2"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/mudkjp/ai-sdk-provider-chatgpt-subscription.git"
+	}
+}
