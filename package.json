@@ -1,7 +1,7 @@
 {
 	"name": "@mudkipdev/ai-sdk-provider-chatgpt-subscription",
-	"version": "0.1.0",
-	"description": "AI SDK provider for ChatGPT plan usage with OAuth sign-in, token refresh, model discovery, and Responses API support",
+	"version": "1.0.0",
+	"description": "AI SDK provider that uses a ChatGPT Plus or Pro subscription instead of an OpenAI API key",
 	"keywords": [
 		"ai-sdk",
 		"chatgpt",
@@ -16,7 +16,7 @@
 	"module": "./dist/index.js",
 	"types": "./dist/index.d.ts",
 	"bin": {
-		"chatgpt-subscription": "./dist/cli.js"
+		"chatgpt-subscription": "dist/cli.js"
 	},
 	"exports": {
 		".": {
@@ -60,5 +60,13 @@
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/mudkjp/ai-sdk-provider-chatgpt-subscription.git"
+	},
+	"homepage": "https://github.com/mudkjp/ai-sdk-provider-chatgpt-subscription#readme",
+	"bugs": {
+		"url": "https://github.com/mudkjp/ai-sdk-provider-chatgpt-subscription/issues"
+	},
+	"author": {
+		"name": "mudkipdev",
+		"url": "https://github.com/mudkjp"
 	}
 }

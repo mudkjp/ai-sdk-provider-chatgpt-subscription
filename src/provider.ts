@@ -1,4 +1,5 @@
 import { createOpenAI } from "@ai-sdk/openai";
+import type { LanguageModelV4 } from "@ai-sdk/provider";
 import type { FetchFunction } from "@ai-sdk/provider-utils";
 import { getChatGPTAccessToken } from "./auth.js";
 import { apiError, apiErrorCode, ChatGPTError, isObject } from "./errors.js";
@@ -23,7 +24,14 @@ const UNSUPPORTED_FIELDS = [
 	"user",
 ];
 
-const ALLOWED_TOOL_TYPES = new Set(["function", "custom", "namespace", "web_search", "web_search_preview"]);
+const ALLOWED_TOOL_TYPES = new Set([
+	"function",
+	"custom",
+	"namespace",
+	"web_search",
+	"web_search_2025_08_26",
+	"web_search_preview",
+]);
 const UNSUPPORTED_INPUT_TYPES = new Set(["input_audio", "input_video", "audio", "video"]);
 const NON_RETRYABLE_API_CODES = new Set([
 	"subscription_sharing_user_not_eligible",
@@ -31,9 +39,11 @@ const NON_RETRYABLE_API_CODES = new Set([
 	"subscription_sharing_unsupported_capability",
 	"subscription_sharing_route_not_supported",
 	"subscription_sharing_invalid_user",
+	"subscription_sharing_v2_client_not_enabled",
 	"chatpass_v2_scope_not_authorized",
 	"chatpass_v2_invalid_authorization_context",
 	"invalid_api_key",
+	"invalid_client",
 	"invalid_token",
 	"model_not_found",
 ]);
@@ -67,6 +77,21 @@ function isSystemMessage(value: unknown): boolean {
 	return isObject(value) && value.role === "system";
 }
 
+function instructionsText(value: unknown): string | undefined {
+	if (typeof value === "string") {
+		return value;
+	}
+
+	if (
+		Array.isArray(value) &&
+		value.every((part) => isObject(part) && (part.type === "text" || part.type === "input_text"))
+	) {
+		return textOf(value);
+	}
+
+	return undefined;
+}
+
 function invalidInput(message: string): ChatGPTError {
 	return new ChatGPTError("invalid_input", message);
 }
@@ -96,7 +121,14 @@ function validateInput(input: unknown[]): void {
 
 		validateMedia(item);
 
-		if (item.type === "additional_tools" && Array.isArray(item.tools)) {
+		if (item.type === "item_reference") {
+			throw new ChatGPTError(
+				"unsupported_input",
+				"ChatGPT plan usage requires the full conversation history in input. Do not send item_reference.",
+			);
+		}
+
+		if (item.type === "additional_tools") {
 			validateTools(item.tools);
 		}
 
@@ -127,8 +159,26 @@ function validateTools(value: unknown): Array<Record<string, unknown>> {
 			);
 		}
 
+		if (
+			(tool.type === "function" || tool.type === "custom") &&
+			(typeof tool.name !== "string" || tool.name.length === 0)
+		) {
+			throw new ChatGPTError("invalid_tools", "ChatGPT requires function and custom tools to have a name.");
+		}
+
+		if (Array.isArray(tool.allowed_callers) && tool.allowed_callers.includes("programmatic")) {
+			throw new ChatGPTError(
+				"unsupported_tool",
+				"ChatGPT plan usage does not support programmatic tool calling.",
+			);
+		}
+
+		if (tool.defer_loading === true) {
+			throw new ChatGPTError("unsupported_tool", "ChatGPT plan usage does not support deferred tool loading.");
+		}
+
 		if (tool.type === "namespace") {
-			if (typeof tool.name !== "string" || !Array.isArray(tool.tools)) {
+			if (typeof tool.name !== "string" || tool.name.length === 0 || !Array.isArray(tool.tools)) {
 				throw new ChatGPTError("invalid_tools", "ChatGPT tool namespaces require a name and tools array.");
 			}
 
@@ -138,6 +188,21 @@ function validateTools(value: unknown): Array<Record<string, unknown>> {
 						"unsupported_tool",
 						"ChatGPT tool namespaces may only contain function or custom tools.",
 					);
+				}
+
+				if (typeof child.name !== "string" || child.name.length === 0) {
+					throw new ChatGPTError("invalid_tools", "ChatGPT requires function and custom tools to have a name.");
+				}
+
+				if (Array.isArray(child.allowed_callers) && child.allowed_callers.includes("programmatic")) {
+					throw new ChatGPTError(
+						"unsupported_tool",
+						"ChatGPT plan usage does not support programmatic tool calling.",
+					);
+				}
+
+				if (child.defer_loading === true) {
+					throw new ChatGPTError("unsupported_tool", "ChatGPT plan usage does not support deferred tool loading.");
 				}
 			}
 		}
@@ -172,7 +237,7 @@ function groupTools(
 	if (isObject(toolChoice)) {
 		throw new ChatGPTError(
 			"unsupported_tool_choice",
-			"groupTools cannot be combined with a named tool_choice. Use auto, required, or none, or disable groupTools.",
+			"Named tool_choice cannot target tools grouped by groupTools. Use auto, required, or none, or provide the tools in your own namespace and disable groupTools.",
 		);
 	}
 
@@ -241,8 +306,14 @@ export function transformChatGPTRequest(
 	body.input = body.input.filter((message) => !isSystemMessage(message));
 
 	if (system) {
-		const instructions = typeof body.instructions === "string" ? body.instructions : textOf(body.instructions);
-		body.instructions = [instructions, system].filter(Boolean).join("\n\n");
+		const instructions =
+			body.instructions === undefined || body.instructions === null ? "" : instructionsText(body.instructions);
+
+		if (instructions === undefined) {
+			body.input = [{ role: "developer", content: system }, ...(body.input as unknown[])];
+		} else {
+			body.instructions = [instructions, system].filter(Boolean).join("\n\n");
+		}
 	}
 
 	if (body.tools !== undefined && body.tools !== null) {
@@ -272,7 +343,7 @@ function parseSseEvent(block: string): Record<string, unknown> | undefined {
 		.map((line) => line.slice(5).trimStart())
 		.join("\n");
 
-	if (!data || data === "[DONE]") {
+	if (!data || data.trim() === "[DONE]") {
 		return undefined;
 	}
 
@@ -284,15 +355,108 @@ function parseSseEvent(block: string): Record<string, unknown> | undefined {
 	}
 }
 
-async function bufferResponsesStream(response: Response): Promise<Response> {
-	const text = await response.text();
+const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 
-	if (text.length > 64 * 1024 * 1024) {
+async function readResponseText(response: Response, signal?: AbortSignal): Promise<string> {
+	const declared = Number(response.headers.get("content-length"));
+
+	if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+		await response.body?.cancel().catch(() => undefined);
 		throw new ChatGPTError("response_too_large", "ChatGPT returned a response that is too large.", { retryable: false });
 	}
 
+	if (!response.body) {
+		return "";
+	}
+
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+
+			if (done) {
+				break;
+			}
+
+			total += value.byteLength;
+
+			if (total > MAX_RESPONSE_BYTES) {
+				await reader.cancel().catch(() => undefined);
+				throw new ChatGPTError("response_too_large", "ChatGPT returned a response that is too large.", {
+					retryable: false,
+				});
+			}
+
+			chunks.push(value);
+		}
+	} catch (error) {
+		if (error instanceof ChatGPTError) {
+			throw error;
+		}
+
+		if (signal?.aborted) {
+			throw new ChatGPTError("cancelled", "The request was cancelled.", { cause: error });
+		}
+
+		throw new ChatGPTError("stream_interrupted", "ChatGPT response stream ended unexpectedly.", {
+			cause: error,
+			retryable: true,
+		});
+	} finally {
+		reader.releaseLock();
+	}
+
+	if (signal?.aborted) {
+		throw new ChatGPTError("cancelled", "The request was cancelled.");
+	}
+
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+
+	return new TextDecoder().decode(bytes);
+}
+
+const STREAM_ERROR_STATUS: Record<string, number> = {
+	subscription_sharing_usage_limit_exceeded: 429,
+	subscription_sharing_usage_unavailable: 503,
+	subscription_sharing_user_unavailable: 503,
+	subscription_sharing_user_not_eligible: 403,
+	subscription_sharing_v2_client_not_enabled: 403,
+	subscription_sharing_route_not_supported: 403,
+	subscription_sharing_invalid_user: 401,
+	subscription_sharing_unsupported_capability: 400,
+	chatpass_v2_scope_not_authorized: 403,
+	chatpass_v2_invalid_authorization_context: 403,
+	rate_limit_exceeded: 429,
+	insufficient_quota: 429,
+	server_error: 500,
+	timeout: 504,
+	authentication_error: 401,
+	permission_error: 403,
+	not_found_error: 404,
+};
+
+function streamErrorStatus(body: unknown): number {
+	return STREAM_ERROR_STATUS[apiErrorCode(body) ?? ""] ?? 400;
+}
+
+async function bufferResponsesStream(response: Response, signal?: AbortSignal): Promise<Response> {
+	const text = await readResponseText(response, signal);
+
+	if (signal?.aborted) {
+		throw new ChatGPTError("cancelled", "The request was cancelled.");
+	}
+
 	const requestId = response.headers.get("openai-request-id") ?? response.headers.get("x-request-id") ?? undefined;
-	let completed: Record<string, unknown> | undefined;
+	let terminal: Record<string, unknown> | undefined;
 	let sawEvent = false;
 
 	for (const block of text.split(/\r?\n\r?\n/)) {
@@ -305,27 +469,33 @@ async function bufferResponsesStream(response: Response): Promise<Response> {
 		sawEvent = true;
 
 		if (event.type === "response.completed") {
-			completed = isObject(event.response) ? event.response : undefined;
+			terminal = isObject(event.response) ? event.response : undefined;
+			continue;
+		}
+
+		if (event.type === "response.incomplete") {
+			if (!isObject(event.response)) {
+				throw new ChatGPTError("response_incomplete", "ChatGPT stopped before completing the response.", {
+					retryable: false,
+					requestId,
+				});
+			}
+
+			terminal = event.response;
 			continue;
 		}
 
 		if (event.type === "response.failed") {
-			throw apiError(isObject(event.response) ? event.response.error : event, 400, requestId);
-		}
-
-		if (event.type === "response.incomplete") {
-			throw new ChatGPTError("response_incomplete", "ChatGPT stopped before completing the response.", {
-				retryable: true,
-				requestId,
-			});
+			const body = isObject(event.response) ? event.response : event;
+			throw apiError(body, streamErrorStatus(body), requestId, response.headers);
 		}
 
 		if (event.type === "error") {
-			throw apiError(event.error ?? event, 400, requestId);
+			throw apiError(event, streamErrorStatus(event), requestId, response.headers);
 		}
 	}
 
-	if (!completed) {
+	if (!terminal) {
 		if (!sawEvent) {
 			let value: unknown;
 
@@ -339,6 +509,7 @@ async function bufferResponsesStream(response: Response): Promise<Response> {
 				const headers = new Headers(response.headers);
 				headers.delete("content-encoding");
 				headers.delete("content-length");
+				headers.delete("transfer-encoding");
 				headers.set("content-type", "application/json");
 				return new Response(JSON.stringify(value), { status: response.status, headers });
 			}
@@ -353,6 +524,7 @@ async function bufferResponsesStream(response: Response): Promise<Response> {
 	const headers = new Headers(response.headers);
 	headers.delete("content-encoding");
 	headers.delete("content-length");
+	headers.delete("transfer-encoding");
 	headers.set("content-type", "application/json");
 
 	if (requestId) {
@@ -360,7 +532,7 @@ async function bufferResponsesStream(response: Response): Promise<Response> {
 		headers.set("x-request-id", requestId);
 	}
 
-	return new Response(JSON.stringify(completed), { status: 200, headers });
+	return new Response(JSON.stringify(terminal), { status: 200, headers });
 }
 
 function createFetch(options: ChatGPTProviderOptions): FetchFunction {
@@ -384,6 +556,7 @@ function createFetch(options: ChatGPTProviderOptions): FetchFunction {
 			body,
 			response.status,
 			response.headers.get("openai-request-id") ?? response.headers.get("x-request-id"),
+			response.headers,
 		);
 	}
 
@@ -397,7 +570,21 @@ function createFetch(options: ChatGPTProviderOptions): FetchFunction {
 			throw new ChatGPTError("unsupported_route", "ChatGPT plan usage requires an absolute Responses API URL.");
 		}
 
-		if (endpoint.origin !== "https://api.openai.com" || endpoint.pathname !== "/v1/responses") {
+		if (
+			endpoint.origin !== "https://api.openai.com" ||
+			endpoint.pathname !== "/v1/responses" ||
+			endpoint.username !== "" ||
+			endpoint.password !== ""
+		) {
+			throw new ChatGPTError(
+				"unsupported_route",
+				"ChatGPT plan usage only supports POST https://api.openai.com/v1/responses. Use the provider as a function or call provider.responses().",
+			);
+		}
+
+		const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+
+		if (method !== "POST") {
 			throw new ChatGPTError(
 				"unsupported_route",
 				"ChatGPT plan usage only supports POST https://api.openai.com/v1/responses. Use the provider as a function or call provider.responses().",
@@ -412,6 +599,25 @@ function createFetch(options: ChatGPTProviderOptions): FetchFunction {
 		let body = init?.body;
 		let bufferStream = false;
 
+		if (body === undefined && input instanceof Request && input.bodyUsed) {
+			throw new ChatGPTError("invalid_request", "ChatGPT request body has already been consumed.");
+		}
+
+		if (body === undefined && input instanceof Request && input.body !== null) {
+			try {
+				body = await input.clone().text();
+			} catch (error) {
+				throw new ChatGPTError("invalid_request", "ChatGPT request body could not be read.", { cause: error });
+			}
+
+			baseHeaders.delete("content-length");
+			baseHeaders.delete("transfer-encoding");
+		}
+
+		if (body !== undefined && body !== null && typeof body !== "string") {
+			throw new ChatGPTError("invalid_request", "ChatGPT requests must use a JSON string body.");
+		}
+
 		if (typeof body === "string") {
 			let request: Record<string, unknown>;
 
@@ -423,6 +629,8 @@ function createFetch(options: ChatGPTProviderOptions): FetchFunction {
 
 			bufferStream = request.stream !== true;
 			body = JSON.stringify(transformChatGPTRequest(request, groupToolsOption));
+			baseHeaders.delete("content-length");
+			baseHeaders.delete("transfer-encoding");
 		}
 
 		const send = async (accessToken: string) => {
@@ -431,15 +639,20 @@ function createFetch(options: ChatGPTProviderOptions): FetchFunction {
 			return inner(input, { ...init, headers, body, redirect: "error" });
 		};
 
-		const accessToken = await getChatGPTAccessToken(options.authPath, inner);
+		const accessToken = await getChatGPTAccessToken(options.authPath, inner, undefined, init?.signal ?? undefined);
 		let response = await send(accessToken);
-		const replayable = !(input instanceof Request) && (typeof body === "string" || body === undefined || body === null);
+		const replayable = typeof body === "string" || body === undefined || body === null;
 
 		if (response.status === 401 && options.refreshOnUnauthorized !== false && replayable) {
 			let refreshError: unknown;
 
 			try {
-				const refreshed = await getChatGPTAccessToken(options.authPath, inner, accessToken);
+				const refreshed = await getChatGPTAccessToken(
+					options.authPath,
+					inner,
+					accessToken,
+					init?.signal ?? undefined,
+				);
 
 				if (refreshed && refreshed !== accessToken) {
 					await response.body?.cancel().catch(() => undefined);
@@ -449,30 +662,71 @@ function createFetch(options: ChatGPTProviderOptions): FetchFunction {
 				refreshError = error;
 			}
 
-			if (
-				refreshError instanceof ChatGPTError &&
-				(refreshError.code === "reauth_required" ||
-					refreshError.code === "not_signed_in" ||
-					refreshError.code === "plan_usage_disabled")
-			) {
+			if (refreshError !== undefined) {
+				await response.body?.cancel().catch(() => undefined);
+			}
+
+			if (refreshError instanceof ChatGPTError) {
 				throw refreshError;
+			}
+
+			if (refreshError !== undefined) {
+				throw new ChatGPTError("refresh_failed", "ChatGPT credentials could not be refreshed.", {
+					cause: refreshError,
+					retryable: true,
+				});
 			}
 		}
 
 		await stopNonRetryable(response);
 
 		if (bufferStream && response.ok) {
-			response = await bufferResponsesStream(response);
+			response = await bufferResponsesStream(response, init?.signal ?? undefined);
 		}
 
 		return response;
 	}) as FetchFunction;
 }
 
+function withStoreDisabled<T extends { providerOptions?: Record<string, Record<string, unknown>> }>(options: T): T {
+	const openai = options.providerOptions?.openai;
+
+	return {
+		...options,
+		providerOptions: {
+			...options.providerOptions,
+			openai: { ...openai, store: false },
+		},
+	};
+}
+
+function wrapResponsesModel(model: LanguageModelV4): LanguageModelV4 {
+	return new Proxy(model, {
+		get(target, property, receiver) {
+			if (property === "doGenerate") {
+				return (options: Parameters<LanguageModelV4["doGenerate"]>[0]) =>
+					target.doGenerate.call(target, withStoreDisabled(options));
+			}
+
+			if (property === "doStream") {
+				return (options: Parameters<LanguageModelV4["doStream"]>[0]) =>
+					target.doStream.call(target, withStoreDisabled(options));
+			}
+
+			return Reflect.get(target, property, target);
+		},
+	});
+}
+
 export function createChatGPTProvider(options: ChatGPTProviderOptions = {}) {
-	return createOpenAI({
+	const base = createOpenAI({
 		apiKey: "chatgpt-oauth",
 		baseURL: "https://api.openai.com/v1",
 		fetch: createFetch(options),
 	});
+	const provider = ((modelId: string) => wrapResponsesModel(base(modelId))) as typeof base;
+	Object.assign(provider, base);
+	provider.languageModel = (modelId: string) => wrapResponsesModel(base.languageModel(modelId));
+	provider.responses = (modelId: string) => wrapResponsesModel(base.responses(modelId));
+	return provider;
 }

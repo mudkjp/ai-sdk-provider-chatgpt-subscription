@@ -4,6 +4,8 @@ export interface ChatGPTErrorOptions {
 	cause?: unknown;
 	param?: string;
 	requestId?: string;
+	responseBody?: string;
+	responseHeaders?: Record<string, string>;
 	retryable?: boolean;
 	status?: number;
 }
@@ -19,6 +21,8 @@ export class ChatGPTError extends APICallError {
 			url: "https://api.openai.com/v1",
 			requestBodyValues: {},
 			statusCode: options.status,
+			responseHeaders: options.responseHeaders,
+			responseBody: options.responseBody,
 			cause: options.cause,
 			isRetryable: options.retryable ?? false,
 		});
@@ -101,7 +105,36 @@ export function apiErrorCode(body: unknown): string | undefined {
 	return undefined;
 }
 
-export function apiError(body: unknown, status?: number, requestId?: string | null): ChatGPTError {
+function responseBodyOf(body: unknown): string | undefined {
+	if (body === undefined) {
+		return undefined;
+	}
+
+	if (typeof body === "string") {
+		return body;
+	}
+
+	try {
+		return JSON.stringify(body);
+	} catch {
+		return undefined;
+	}
+}
+
+function responseHeadersOf(headers: Headers | Record<string, string> | undefined): Record<string, string> | undefined {
+	if (headers === undefined) {
+		return undefined;
+	}
+
+	return headers instanceof Headers ? Object.fromEntries(headers.entries()) : { ...headers };
+}
+
+export function apiError(
+	body: unknown,
+	status?: number,
+	requestId?: string | null,
+	responseHeaders?: Headers | Record<string, string>,
+): ChatGPTError {
 	const code = apiErrorCode(body) ?? "api_error";
 	const known = API_MESSAGES[code];
 	const detail = isObject(body) ? (isObject(body.error) ? body.error : isObject(body.detail) ? body.detail : body) : undefined;
@@ -109,6 +142,8 @@ export function apiError(body: unknown, status?: number, requestId?: string | nu
 		status,
 		requestId: safeIdentifier(requestId),
 		param: isObject(detail) ? safeIdentifier(detail.param) : undefined,
+		responseBody: responseBodyOf(body),
+		responseHeaders: responseHeadersOf(responseHeaders),
 	};
 
 	if (known) {
@@ -154,7 +189,7 @@ export async function jsonResponse(response: Response): Promise<unknown> {
 			});
 		}
 
-		throw apiError(undefined, response.status, requestIdOf(response.headers));
+		throw apiError(undefined, response.status, requestIdOf(response.headers), response.headers);
 	}
 }
 

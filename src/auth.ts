@@ -159,7 +159,10 @@ async function resolvePendingIdentity(
 		await writeChatGPTAccount(authPath, next);
 		return next;
 	} catch (error) {
-		if (error instanceof ChatGPTError && error.code === "identity_verification_unavailable") {
+		if (
+			error instanceof ChatGPTError &&
+			(error.code === "identity_verification_unavailable" || error.code.startsWith("storage_"))
+		) {
 			throw error;
 		}
 
@@ -170,7 +173,12 @@ async function resolvePendingIdentity(
 	}
 }
 
-async function refreshLocked(authPath: string, fetchImpl: typeof fetch, staleAccessToken?: string): Promise<string> {
+async function refreshLocked(
+	authPath: string,
+	fetchImpl: typeof fetch,
+	staleAccessToken?: string,
+	signal?: AbortSignal,
+): Promise<string> {
 	let account = await readChatGPTAccount(authPath);
 
 	if (!account) {
@@ -204,7 +212,7 @@ async function refreshLocked(authPath: string, fetchImpl: typeof fetch, staleAcc
 	let refreshed: Awaited<ReturnType<typeof refreshChatGPTTokens>>;
 
 	try {
-		refreshed = await refreshChatGPTTokens(account, fetchImpl);
+		refreshed = await refreshChatGPTTokens(account, fetchImpl, signal);
 	} catch (error) {
 		if (isReauthenticationError(error)) {
 			await clearCredentials(authPath, account, true);
@@ -267,6 +275,10 @@ async function saveAccount(authPath: string, account: ChatGPTAccount): Promise<v
 }
 
 export async function loginChatGPT(options: ChatGPTLoginOptions = {}): Promise<ChatGPTLoginResult> {
+	if (options.signal?.aborted) {
+		throw new ChatGPTError("cancelled", "ChatGPT sign-in was cancelled.");
+	}
+
 	const authPath = options.authPath ?? chatGPTAuthPath();
 	const fetchImpl = options.fetch ?? fetch;
 	const previous = await readChatGPTAccount(authPath);
@@ -300,6 +312,10 @@ export async function loginChatGPT(options: ChatGPTLoginOptions = {}): Promise<C
 			});
 		},
 	});
+	if (options.signal?.aborted) {
+		throw new ChatGPTError("cancelled", "ChatGPT sign-in was cancelled.");
+	}
+
 	const account: ChatGPTAccount = {
 		version: 1,
 		clientId: authorization.clientId,
@@ -327,9 +343,10 @@ export async function getChatGPTAccessToken(
 	authPath = chatGPTAuthPath(),
 	fetchImpl: typeof fetch = fetch,
 	staleAccessToken?: string,
+	signal?: AbortSignal,
 ): Promise<string> {
 	if (staleAccessToken !== undefined) {
-		return withChatGPTAccountLock(authPath, () => refreshLocked(authPath, fetchImpl, staleAccessToken));
+		return withChatGPTAccountLock(authPath, () => refreshLocked(authPath, fetchImpl, staleAccessToken, signal));
 	}
 
 	const account = await readChatGPTAccount(authPath);
@@ -357,7 +374,7 @@ export async function getChatGPTAccessToken(
 			}
 
 			if (Date.now() >= refreshAt(resolved.credentials)) {
-				return refreshLocked(authPath, fetchImpl);
+				return refreshLocked(authPath, fetchImpl, undefined, signal);
 			}
 
 			return resolved.credentials.accessToken;
@@ -372,7 +389,7 @@ export async function getChatGPTAccessToken(
 		return account.credentials.accessToken;
 	}
 
-	return withChatGPTAccountLock(authPath, () => refreshLocked(authPath, fetchImpl));
+	return withChatGPTAccountLock(authPath, () => refreshLocked(authPath, fetchImpl, undefined, signal));
 }
 
 export async function getChatGPTStatus(authPath = chatGPTAuthPath()): Promise<ChatGPTStatus> {
@@ -387,34 +404,34 @@ export async function getChatGPTStatus(authPath = chatGPTAuthPath()): Promise<Ch
 		name: account?.name,
 		subject: account?.subject,
 		scopes: account?.scopes ?? [],
-		expiresAt: account?.credentials?.expiresAt,
+		expiresAt: account?.pendingRefresh?.credentials.expiresAt ?? account?.credentials?.expiresAt,
 		reauthRequired: account?.reauthRequired === true,
 	};
 }
 
 export async function logoutChatGPT(options: ChatGPTLogoutOptions = {}): Promise<ChatGPTLogoutResult> {
 	const authPath = options.authPath ?? chatGPTAuthPath();
-	const account = await readChatGPTAccount(authPath);
 
-	if (!account) {
+	if (!(await readChatGPTAccount(authPath))) {
 		return { authPath, remoteRevoked: true };
 	}
 
-	let remoteRevoked = false;
+	return withChatGPTAccountLock(authPath, async () => {
+		const account = await readChatGPTAccount(authPath);
 
-	try {
-		remoteRevoked = await revokeChatGPTTokens(account, options.fetch ?? fetch);
-	} catch {
-		remoteRevoked = false;
-	}
-
-	await withChatGPTAccountLock(authPath, async () => {
-		const current = await readChatGPTAccount(authPath);
-
-		if (current) {
-			await clearCredentials(authPath, current, false);
+		if (!account) {
+			return { authPath, remoteRevoked: true };
 		}
-	});
 
-	return { authPath, remoteRevoked };
+		let remoteRevoked = false;
+
+		try {
+			remoteRevoked = await revokeChatGPTTokens(account, options.fetch ?? fetch);
+		} catch {
+			remoteRevoked = false;
+		}
+
+		await clearCredentials(authPath, account, false);
+		return { authPath, remoteRevoked };
+	});
 }

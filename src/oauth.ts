@@ -79,8 +79,8 @@ export interface ChatGPTAuthorizeOptions {
 	signal?: AbortSignal;
 }
 
-let discoveryPromise: Promise<Discovery> | undefined;
-const keySets = new Map<string, RemoteJWKSet>();
+const discoveries = new WeakMap<typeof fetch, Promise<Discovery>>();
+const keySets = new WeakMap<typeof fetch, Map<string, RemoteJWKSet>>();
 
 function randomValue(): string {
 	return randomBytes(32).toString("base64url");
@@ -102,68 +102,102 @@ function discoveryError(cause?: unknown): ChatGPTError {
 }
 
 async function discover(fetchImpl: typeof fetch = fetch): Promise<Discovery> {
-	discoveryPromise ??= (async () => {
-		const response = await fetchRemote(
-			`${ISSUER}/.well-known/openid-configuration`,
-			{ headers: { accept: "application/json" } },
-			fetchImpl,
-			15_000,
-		);
-		const data = await jsonResponse(response);
+	let discovery = discoveries.get(fetchImpl);
 
-		if (!response.ok) {
-			throw apiError(data, response.status, response.headers.get("x-request-id"));
-		}
+	if (!discovery) {
+		discovery = (async () => {
+			const response = await fetchRemote(
+				`${ISSUER}/.well-known/openid-configuration`,
+				{ headers: { accept: "application/json" } },
+				fetchImpl,
+				15_000,
+			);
+			const data = await jsonResponse(response);
 
-		if (!isObject(data) || data.issuer !== ISSUER) {
-			throw discoveryError();
-		}
-
-		const endpoint = (key: string, required = true): string | undefined => {
-			const value = data[key];
-
-			if (value === undefined && !required) {
-				return undefined;
+			if (!response.ok) {
+				throw apiError(data, response.status, response.headers.get("x-request-id"), response.headers);
 			}
 
-			if (typeof value !== "string") {
+			if (!isObject(data) || data.issuer !== ISSUER) {
 				throw discoveryError();
 			}
 
-			try {
-				if (new URL(value).origin !== ISSUER) {
+			const endpoint = (key: string, required = true): string | undefined => {
+				const value = data[key];
+
+				if ((value === undefined || value === null) && !required) {
+					return undefined;
+				}
+
+				if (typeof value !== "string") {
 					throw discoveryError();
 				}
-			} catch {
-				throw discoveryError();
-			}
 
-			return value;
-		};
+				try {
+					if (new URL(value).origin !== ISSUER) {
+						throw discoveryError();
+					}
+				} catch {
+					throw discoveryError();
+				}
 
-		return {
-			authorizationEndpoint: endpoint("authorization_endpoint")!,
-			tokenEndpoint: endpoint("token_endpoint")!,
-			jwksUri: endpoint("jwks_uri")!,
-			revocationEndpoint: endpoint("revocation_endpoint", false),
-		};
-	})().catch((error: unknown) => {
-		discoveryPromise = undefined;
-		throw error;
-	});
+				return value;
+			};
 
-	return discoveryPromise;
+			return {
+				authorizationEndpoint: endpoint("authorization_endpoint")!,
+				tokenEndpoint: endpoint("token_endpoint")!,
+				jwksUri: endpoint("jwks_uri")!,
+				revocationEndpoint: endpoint("revocation_endpoint", false),
+			};
+		})().catch((error: unknown) => {
+			discoveries.delete(fetchImpl);
+			throw error;
+		});
+		discoveries.set(fetchImpl, discovery);
+	}
+
+	return discovery;
 }
 
 function keysFor(uri: string, fetchImpl: typeof fetch): RemoteJWKSet {
-	let keys = keySets.get(uri);
+	let sets = keySets.get(fetchImpl);
+
+	if (!sets) {
+		sets = new Map();
+		keySets.set(fetchImpl, sets);
+	}
+
+	let keys = sets.get(uri);
 
 	if (!keys) {
 		keys = createRemoteJWKSet(new URL(uri), {
 			timeoutDuration: 15_000,
-			[customFetch]: (url, init) => fetchImpl(url, { ...init, redirect: "error" }),
+			[customFetch]: async (url, init) => {
+				try {
+					const response = await fetchImpl(url, { ...init, redirect: "error" });
+
+					if (!response.ok) {
+						throw unavailableIdentity();
+					}
+
+					const body = await response.clone().json().catch(() => undefined);
+
+					if (!isObject(body) || !Array.isArray(body.keys)) {
+						throw unavailableIdentity();
+					}
+
+					return response;
+				} catch (error) {
+					if (error instanceof ChatGPTError && error.code === "identity_verification_unavailable") {
+						throw error;
+					}
+
+					throw unavailableIdentity(error);
+				}
+			},
 		});
-		keySets.set(uri, keys);
+		sets.set(uri, keys);
 	}
 
 	return keys;
@@ -245,8 +279,8 @@ function pkce(): { verifier: string; challenge: string } {
 function parseEarliestRefreshAt(value: unknown): number | undefined {
 	const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
 
-	if (Number.isFinite(numeric) && numeric > 0) {
-		return numeric > 1e12 ? numeric : numeric * 1000;
+	if (Number.isFinite(numeric)) {
+		return numeric > 0 ? (numeric > 1e12 ? numeric : numeric * 1000) : undefined;
 	}
 
 	if (typeof value === "string") {
@@ -262,10 +296,16 @@ function tokenFields(
 	previous?: { scopes: string[]; refreshToken?: string },
 	requireRefresh = false,
 ): ParsedTokenFields {
-	const scopes = token.scope ? token.scope.trim().split(/\s+/).filter(Boolean) : previous?.scopes;
+	const scopes = token.scope === undefined ? previous?.scopes : token.scope.trim().split(/\s+/).filter(Boolean);
 	const refreshToken = token.refresh_token ?? previous?.refreshToken;
 
-	if (!scopes?.length || ((requireRefresh || scopes.includes("offline_access")) && !refreshToken)) {
+	const expiresAt = Date.now() + token.expires_in * 1000;
+
+	if (
+		!scopes?.length ||
+		!Number.isFinite(expiresAt) ||
+		((requireRefresh || scopes.includes("offline_access")) && !refreshToken)
+	) {
 		throw new ChatGPTError("invalid_token_response", "ChatGPT returned incomplete credentials. Sign in again.");
 	}
 
@@ -273,7 +313,7 @@ function tokenFields(
 		credentials: {
 			accessToken: token.access_token,
 			refreshToken,
-			expiresAt: Date.now() + token.expires_in * 1000,
+			expiresAt,
 			earliestRefreshAt: parseEarliestRefreshAt(token.earliest_refresh_at),
 		},
 		scopes,
@@ -314,7 +354,7 @@ async function tokenRequest(
 	const data = await jsonResponse(response);
 
 	if (!response.ok) {
-		throw apiError(data, response.status, response.headers.get("x-request-id"));
+		throw apiError(data, response.status, response.headers.get("x-request-id"), response.headers);
 	}
 
 	if (!isObject(data)) {
@@ -500,6 +540,10 @@ async function listenForCallback(
 }
 
 export async function authorizeChatGPT(options: ChatGPTAuthorizeOptions): Promise<ChatGPTAuthorization> {
+	if (options.signal?.aborted) {
+		throw new ChatGPTError("cancelled", "ChatGPT sign-in was cancelled.");
+	}
+
 	const fetchImpl = options.fetch ?? fetch;
 	const port = options.port ?? 1455;
 
@@ -583,6 +627,10 @@ export async function authorizeChatGPT(options: ChatGPTAuthorizeOptions): Promis
 				"account_mismatch",
 				"This sign-in returned a different ChatGPT account. Use a separate auth file for each account.",
 			);
+		}
+
+		if (options.signal?.aborted) {
+			throw new ChatGPTError("cancelled", "ChatGPT sign-in was cancelled.");
 		}
 
 		return {
